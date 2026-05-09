@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""CS 4700 Project 1 Wordle client.
+
+Connects to the project server, speaks the JSON-line protocol, and prints the
+secret flag returned by the server.  The implementation intentionally uses only
+Python's standard library so it can run in Gradescope's command-line environment.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import ssl
+import sys
+import urllib.request
+from collections import Counter
+from typing import Any, Iterable
+
+DEFAULT_PORT = 27993
+DEFAULT_TLS_PORT = 27994
+WORD_LIST_URL = "https://4700.network/projects/project1-words.txt"
+MAX_GUESSES = 500
+
+# A tiny emergency fallback lets unit tests exercise the protocol without the
+# network-hosted word list.  Normal submissions use the bundled or downloaded
+# official word list instead.
+FALLBACK_WORDS = [
+    "raise", "tares", "treat", "sweat", "steam", "crane", "slate", "trace",
+    "adieu", "audio", "about", "other", "there", "which", "their", "apple",
+]
+
+
+class ProtocolError(Exception):
+    """Raised when the peer sends malformed or unexpected protocol data."""
+
+
+class UsageError(Exception):
+    """Raised when command-line arguments do not match the project spec."""
+
+
+def parse_args(argv: list[str]) -> tuple[str, int, str, bool]:
+    """Parse the exact command shape: ./client <-p port> <-s> hostname username."""
+    use_tls = False
+    port: int | None = None
+    i = 0
+
+    if i < len(argv) and argv[i] == "-p":
+        if i + 1 >= len(argv):
+            raise UsageError("missing value after -p")
+        try:
+            port = int(argv[i + 1])
+        except ValueError as exc:
+            raise UsageError("port must be an integer") from exc
+        if not (1 <= port <= 65535):
+            raise UsageError("port must be between 1 and 65535")
+        i += 2
+
+    if i < len(argv) and argv[i] == "-s":
+        use_tls = True
+        i += 1
+
+    if len(argv) - i != 2:
+        raise UsageError("usage: ./client <-p port> <-s> <hostname> <Northeastern-username>")
+
+    hostname = argv[i]
+    username = argv[i + 1]
+    if port is None:
+        port = DEFAULT_TLS_PORT if use_tls else DEFAULT_PORT
+    return hostname, port, username, use_tls
+
+
+def load_words() -> list[str]:
+    """Load official guesses from a local file, or download them if absent."""
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "project1-words.txt")
+    raw = ""
+    if os.path.exists(local_path):
+        with open(local_path, "r", encoding="ascii") as word_file:
+            raw = word_file.read()
+    else:
+        try:
+            request = urllib.request.Request(WORD_LIST_URL, headers={"User-Agent": "cs4700-client"})
+            with urllib.request.urlopen(request, timeout=15) as response:
+                raw = response.read().decode("ascii")
+        except Exception:
+            # Keep this as a last resort only; the real project should submit the
+            # official word list or allow the client to download it.
+            return FALLBACK_WORDS.copy()
+
+    words = [word.strip() for word in raw.splitlines() if word.strip()]
+    words = [word for word in words if len(word) == 5 and word.islower()]
+    if not words:
+        raise ProtocolError("word list is empty or malformed")
+    return words
+
+
+def connect(hostname: str, port: int, use_tls: bool) -> socket.socket:
+    """Open a TCP socket, wrapping it in TLS when requested."""
+    raw_socket = socket.create_connection((hostname, port), timeout=30)
+    if not use_tls:
+        return raw_socket
+    context = ssl.create_default_context()
+    return context.wrap_socket(raw_socket, server_hostname=hostname)
+
+
+def send_json(sock_file: Any, message: dict[str, Any]) -> None:
+    """Send one JSON object followed by the required line feed."""
+    encoded = json.dumps(message, separators=(",", ":"), ensure_ascii=True).encode("ascii") + b"\n"
+    sock_file.write(encoded)
+    sock_file.flush()
+
+
+def recv_json(sock_file: Any) -> dict[str, Any]:
+    """Read exactly one newline-terminated JSON message."""
+    line = sock_file.readline()
+    if not line:
+        raise ProtocolError("server closed the connection")
+    try:
+        message = json.loads(line.decode("ascii"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProtocolError("server sent invalid JSON") from exc
+    if not isinstance(message, dict):
+        raise ProtocolError("server message was not a JSON object")
+    return message
+
+
+def validate_start(message: dict[str, Any]) -> str:
+    if set(message) != {"type", "id"} or message.get("type") != "start" or not isinstance(message.get("id"), str):
+        raise ProtocolError(f"unexpected start message: {message}")
+    return message["id"]
+
+
+def validate_retry(message: dict[str, Any], game_id: str) -> list[dict[str, Any]]:
+    if message.get("type") == "error":
+        raise ProtocolError(str(message.get("message", "server error")))
+    if set(message) != {"type", "id", "guesses"} or message.get("type") != "retry" or message.get("id") != game_id:
+        raise ProtocolError(f"unexpected retry message: {message}")
+    guesses = message.get("guesses")
+    if not isinstance(guesses, list):
+        raise ProtocolError("retry guesses field is not a list")
+    for entry in guesses:
+        if not isinstance(entry, dict) or set(entry) != {"word", "marks"}:
+            raise ProtocolError("retry guess history entry is malformed")
+        if not isinstance(entry["word"], str) or len(entry["word"]) != 5:
+            raise ProtocolError("retry word is malformed")
+        marks = entry["marks"]
+        if not isinstance(marks, list) or len(marks) != 5 or any(mark not in (0, 1, 2) for mark in marks):
+            raise ProtocolError("retry marks are malformed")
+    return guesses
+
+
+def score_guess(guess: str, secret: str) -> tuple[int, int, int, int, int]:
+    """Return Wordle-style marks for guess against secret, including duplicates."""
+    marks = [0] * 5
+    remaining = Counter()
+    for index, (g_char, s_char) in enumerate(zip(guess, secret)):
+        if g_char == s_char:
+            marks[index] = 2
+        else:
+            remaining[s_char] += 1
+    for index, g_char in enumerate(guess):
+        if marks[index] == 0 and remaining[g_char] > 0:
+            marks[index] = 1
+            remaining[g_char] -= 1
+    return tuple(marks)  # type: ignore[return-value]
+
+
+def consistent_candidates(words: Iterable[str], history: list[dict[str, Any]]) -> list[str]:
+    """Keep words that would have produced every mark sequence in history."""
+    candidates: list[str] = []
+    normalized_history = [(entry["word"], tuple(entry["marks"])) for entry in history]
+    for candidate in words:
+        if all(score_guess(guess, candidate) == marks for guess, marks in normalized_history):
+            candidates.append(candidate)
+    return candidates
+
+
+def choose_guess(words: list[str], history: list[dict[str, Any]]) -> str:
+    """Choose a valid next guess using constraint filtering plus frequency scoring."""
+    if not history:
+        for starter in ("tares", "raise", "slate", "crane", "treat"):
+            if starter in words:
+                return starter
+        return words[0]
+
+    candidates = consistent_candidates(words, history)
+    if not candidates:
+        raise ProtocolError("no candidate words remain after applying server marks")
+    if len(candidates) == 1:
+        return candidates[0]
+
+    positional = [Counter(candidate[index] for candidate in candidates) for index in range(5)]
+    overall = Counter(char for candidate in candidates for char in set(candidate))
+
+    guessed = {entry["word"] for entry in history}
+
+    def word_score(word: str) -> tuple[int, int, int]:
+        positional_score = sum(positional[index][char] for index, char in enumerate(word))
+        uniqueness_score = sum(overall[char] for char in set(word))
+        is_new = 1 if word not in guessed else 0
+        return (is_new, positional_score + uniqueness_score, -len(set(word)))
+
+    return max(candidates, key=word_score)
+
+
+def play(hostname: str, port: int, username: str, use_tls: bool) -> str:
+    words = load_words()
+    with connect(hostname, port, use_tls) as sock:
+        with sock.makefile("rwb") as sock_file:
+            send_json(sock_file, {"type": "hello", "northeastern_username": username})
+            first_response = recv_json(sock_file)
+            if first_response.get("type") == "error":
+                raise ProtocolError(str(first_response.get("message", "server error")))
+            game_id = validate_start(first_response)
+            history: list[dict[str, Any]] = []
+
+            for _ in range(MAX_GUESSES):
+                word = choose_guess(words, history)
+                send_json(sock_file, {"type": "guess", "id": game_id, "word": word})
+                response = recv_json(sock_file)
+
+                if response.get("type") == "bye":
+                    if set(response) != {"type", "id", "flag"} or response.get("id") != game_id or not isinstance(response.get("flag"), str):
+                        raise ProtocolError(f"unexpected bye message: {response}")
+                    return response["flag"]
+
+                history = validate_retry(response, game_id)
+
+    raise ProtocolError("exceeded maximum allowed guesses")
+
+
+def main(argv: list[str]) -> int:
+    try:
+        hostname, port, username, use_tls = parse_args(argv)
+        flag = play(hostname, port, username, use_tls)
+    except (OSError, ProtocolError, UsageError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(flag)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
